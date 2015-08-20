@@ -1,7 +1,8 @@
-{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE ViewPatterns        #-}
+{-# LANGUAGE ParallelListComp    #-}
 
 -- |CBBGP: PullBuildBenchGraphPush
 --
@@ -37,7 +38,7 @@ import qualified Control.Exception as X
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Text.Read (readMaybe)
-import Data.List (sort)
+import Data.List (sort,intersperse)
 import BenchUtils (readProcessMemory)
 import System.IO
 
@@ -55,7 +56,7 @@ import System.Exit
 import Graphics.Gnuplot.Simple (plotLists, Attribute(..))
 
 -- Interacting with git:
-import System.Process (callCommand)
+import System.Process (runInteractiveCommand, waitForProcess, callCommand)
 import System.Directory
 import System.FilePath ((</>), (<.>), addExtension, takeExtension)
 
@@ -140,9 +141,10 @@ readConfig fp =
     do srcRepo      <- m ! "repo"
        resultRepo   <- m ! "resultRepo"
        buildCommand <- m ! "builder"
-       tagCommand   <- m ! "tagger" >>= maybe (Just "echo ''") Just
+       let tagCommand = HashMap.lookupDefault "echo ''" "tagger" m
        let benchmarks = Prelude.map (uncurry BM) $ Prelude.filter ((`notElem` reservedWords) . fst) (HashMap.toList m)
        return BI {..}
+
   (!) :: HashMap Text Text -> Text -> Maybe Text
   (!) = flip HashMap.lookup
 
@@ -173,29 +175,33 @@ runBenchs cfg = forM_ (HashMap.keys cfg) (\k -> cbbgp k (cfg HashMap.! k))
        putStrLn      "\tDone building"
        numbers     <- doBench benchmarks srcDir
        putStrLn      "\tDone running"
-       dayHour     <- formatTime defaultTimeLocale "%F::%R" <$> getCurrentTime
+       dayHour     <- formatTime defaultTimeLocale "%F::%T" <$> getCurrentTime
        let newResultsName = project </> dayHour <.> "raw.results"
        createDirectoryIfMissing True (resultDir </> project)
-       tag        <- getTag tagCommand
+       tag        <- getTag tagCommand project
        writeFile (resultDir </> newResultsName) (show (tag,numbers))
+       gitAddCommit resultDir newResultsName
+       gitPush resultDir
+       putStrLn      "\tPushed raw results"
        graphFiles <- doGraph resultDir project
        putStrLn      "\tGraphed results"
-       gitAddCommit resultDir newResultsName
        mapM_ (gitAddCommit resultDir) graphFiles
-       putStrLn      "\tCommited files"
        gitPush resultDir
-       putStrLn      "\tPushed - complete!"
+       putStrLn      "\tPushed graphs - complete!"
 
 -- Build the project, returning an error or unit.
 doBuild :: Text -> FilePath -> IO ()
 doBuild cmd dir = withDirectory dir $ callCommand (Text.unpack cmd)
 
-getTag :: Text -> IO String
-getTag cmd = withDirectory project $ do
-    (_sin,sout,_serr,ph) <- runInteractiveCommand cmd
-    tag <- hGetContents sout
+getTag :: Text -> String -> IO String
+getTag cmd project = withDirectory project $ do
+    (_sin,sout,_serr,ph) <- runInteractiveCommand (Text.unpack cmd)
+    tag <- filter (`notElem` badChar) <$> hGetContents sout
     _ec <- waitForProcess ph
     return tag
+ where
+     badChar :: String
+     badChar = "\n\r\DEL"
 
 -- Perform the set of benchmarks and create a new CSV file for the results.
 -- Each benchmark has a name and a command.
@@ -215,41 +221,52 @@ doBench bs dir = withDirectory dir (HashMap.fromList <$> mapM runOne bs)
   getMem :: (a, [Double]) -> Double
   getMem (_,ms) = maximum (0:ms)
 
+type Tag = String
+
 -- Read in any old results and graph all results together, replacing any
--- current "$benchmarkName.svg" file in the directory ($repo/$project/$name.{time,memory}.svg).
+-- current graph at "$repo/$project/$name.{time,memory}.svg".
 --
 -- Pre-existing files should be $repo/$project/*.raw.results and be readable via
--- @read :: String -> HashMap Text (Double, DiffTime)@ (i.e. produced via 'show').
+-- @read :: String -> (TagText,HashMap Text (Double, DiffTime))@ (i.e. produced via 'show').
+--
+-- XXX The over-use of tuples makes this long-in-the-tooth. I should make a small ADT.
 doGraph :: FilePath -> String -> IO [FilePath]
 doGraph repoDir projectName =
-  do allNumbers <- readOldResults
-     let graphs = extractGraphData allNumbers
+  do numbers <- readOldResults
+     let graphs  = extractGraphData numbers
      concat <$> mapM writeGraph graphs
  where
-    extractGraphData :: [HashMap Text (Double, DiffTime)] -> [(Text, [(Double,DiffTime)])]
+    extractGraphData :: [(Tag,HashMap Text (Double, DiffTime))] -> [(Text, [(Tag,Double,DiffTime)])]
     extractGraphData ds =
-        let allKeys = HashMap.keys (HashMap.unions ds)
-        in [(k, catMaybes (map (HashMap.lookup k) ds)) | k <- allKeys]
+        let (tags,maps) = unzip ds
+            allKeys     = HashMap.keys (HashMap.unions maps)
+        in [(k, [ (tag,mem,time) | Just (mem,time) <- map (HashMap.lookup k) maps | tag <- tags]) | k <- allKeys]
 
-    readOldResults :: IO [HashMap Text (Double, DiffTime)]
+    readOldResults :: IO [(Tag, HashMap Text (Double, DiffTime))]
     readOldResults =
       do let dir = repoDir </> projectName
              isResult = (".results" ==) . takeExtension
          resultFiles <- (sort . filter isResult) <$> getDirectoryContents dir
          mapM (fmap read . readFile . (dir </>)) resultFiles
 
-    writeGraph :: (Text, [(Double,DiffTime)]) -> IO [FilePath]
-    writeGraph (benchName, mts) = do
-        let (ms,ts) = unzip mts
-            plot fp xs = plotLists [Custom "terminal" ["svg"], Custom "output" [quote fp]] [xs]
-            fpMS = repoDir </> projectName </> Text.unpack benchName <.> "memory" <.> "svg"
-            fpTS = repoDir </> projectName </> Text.unpack benchName <.> "time"   <.> "svg"
-        plot fpMS ms
-        plot fpTS ts
+    writeGraph :: (Text, [(Tag,Double,DiffTime)]) -> IO [FilePath]
+    writeGraph (benchName, tmts) = do
+        let (tags, mems,times) = unzip3 tmts
+            renderedTags = paren $ intersperse "," $
+                                [quote t ++ " " ++ show n | (Just t,n) <- zip (impulse tags) [0..]]
+            plot fp xs = plotLists [ XTicks (Just renderedTags)
+                                   , Custom "terminal" ["svg"]
+                                   , Custom "output" [quote fp]] [xs]
+            prefix x = repoDir </> projectName </> Text.unpack benchName <.> x
+            fpMS     = prefix $ "memory" <.> "svg"
+            fpTS     = prefix $ "time"   <.> "svg"
+        plot fpMS mems
+        plot fpTS times
         return [fpMS,fpTS]
 
-    quote :: String -> String
-    quote x = concat ["\"",x,"\""]
+    -- Retain those the tags that differ from the immediately preceding tag.
+    impulse :: [Tag] -> [Maybe Tag]
+    impulse xs@(x:ys) = Just x : zipWith (\p c -> if p == c then Nothing else Just c) xs ys
 
 withDirectory :: FilePath -> IO a -> IO a
 withDirectory fp oper =
@@ -273,13 +290,20 @@ timeIt oper =
 gitClone :: Text -> FilePath -> IO FilePath
 gitClone url dir =
     do cwd <- getCurrentDirectory
-       callCommand $ "git clone " ++ Text.unpack url ++ " " ++ dir
+       callCommand $ "git clone " ++ quote (Text.unpack url) ++ " " ++ quote dir
        return (cwd </> dir)
 
 gitAddCommit :: FilePath -> FilePath -> IO ()
 gitAddCommit repoDir file = withDirectory repoDir $ do
-    callCommand $ "git add " ++ file
-    callCommand $ "git commit -m 'auto-commit from mss-bench' " ++ file
+    putStrLn $ "\t\tgit adding and committing file: " ++ quote file
+    callCommand $ "git add " ++ quote file
+    callCommand $ "git commit -m 'auto-commit from mss-bench' " ++ quote file
 
 gitPush :: FilePath -> IO ()
 gitPush fp = setCurrentDirectory fp >> callCommand "git push"
+
+quote :: String -> String
+quote x = concat ["\"",x,"\""]
+
+paren :: [String] -> [String]
+paren x = ["(", concat x, ")"]
