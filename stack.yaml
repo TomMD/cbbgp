@@ -1,0 +1,10 @@
+flags: {}
+packages:
+- '.'
+- ../../bench
+resolver: nightly-2015-08-18
+extra-deps:
+- gnuplot-0.5.4
+- simple-get-opt-0.1.0.0
+- data-accessor-transformers-0.2.1.6
+- utility-ht-0.0.11
