@@ -1,7 +1,8 @@
-{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE ViewPatterns        #-}
+{-# LANGUAGE ParallelListComp    #-}
 
 -- |CBBGP: PullBuildBenchGraphPush
 --
@@ -37,7 +38,6 @@ import qualified Control.Exception as X
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Text.Read (readMaybe)
-import Data.List (sort)
 import BenchUtils (readProcessMemory)
 import System.IO
 
@@ -52,12 +52,15 @@ import Data.Ini
 import SimpleGetOpt
 import Data.Maybe (isNothing, catMaybes)
 import System.Exit
-import Graphics.Gnuplot.Simple (plotLists, Attribute(..))
 
 -- Interacting with git:
-import System.Process (callCommand)
+import System.Process (runInteractiveCommand, waitForProcess, callCommand)
 import System.Directory
 import System.FilePath ((</>), (<.>), addExtension, takeExtension)
+
+import Git
+import Utils
+import Graph
 
 argCfg :: OptSpec Opts
 argCfg =
@@ -65,7 +68,7 @@ argCfg =
 
           , progOptions     =
               [ Option ['p'] ["period"] "Number of seconds between each run"
-                  $ ReqArg "microseconds" $ \a s ->
+                  $ ReqArg "seconds" $ \a s ->
                         case (readMaybe a :: Maybe Integer) of
                           Just n | n > 0 -> Right s { period = fromIntegral n }
                           _              -> Left "Invalid period."
@@ -83,8 +86,6 @@ data BenchInfo = BI { srcRepo       :: Text
                     }
 
 data Benchmark = BM { name, benchCommand :: Text }
-
-type DiffTime = Double
 
 data Opts = Opts { period  :: NominalDiffTime
                  , iniFile :: FilePath
@@ -104,8 +105,8 @@ main = do
     opts <- getOpts argCfg
     mcfg <- readConfig (iniFile opts)
     case mcfg of
-        Nothing  -> dumpUsage argCfg >> exitFailure
-        Just cfg ->
+        Left e    -> print e >> dumpUsage argCfg >> exitFailure
+        Right cfg ->
             do putStrLn $ "Read configuration file.  Executing CBBGP for " ++ show (HashMap.size cfg) ++ " projects."
                periodically (period opts) (runBenchs cfg)
 
@@ -128,21 +129,22 @@ periodically period run =
 
 -- Read an INI configuration file and return either Just a well-formed Ini
 -- with all required fields or Nothing
-readConfig :: FilePath -> IO (Maybe Config)
+readConfig :: FilePath -> IO (Either String Config)
 readConfig fp =
   do ini <- safeReadIniFile fp
      case ini of
-         Left _  -> return Nothing
-         Right c -> return $ mapM convert (unIni c)
+         Left  e -> return $ Left e
+         Right c -> return $ maybe (Left "Missing required field in INI.") Right (mapM convert (unIni c))
   where
   convert :: HashMap Text Text -> Maybe BenchInfo
   convert m =
     do srcRepo      <- m ! "repo"
        resultRepo   <- m ! "resultRepo"
        buildCommand <- m ! "builder"
-       tagCommand   <- m ! "tagger" >>= maybe (Just "echo ''") Just
+       let tagCommand = HashMap.lookupDefault "echo ''" "tagger" m
        let benchmarks = Prelude.map (uncurry BM) $ Prelude.filter ((`notElem` reservedWords) . fst) (HashMap.toList m)
        return BI {..}
+
   (!) :: HashMap Text Text -> Text -> Maybe Text
   (!) = flip HashMap.lookup
 
@@ -173,29 +175,36 @@ runBenchs cfg = forM_ (HashMap.keys cfg) (\k -> cbbgp k (cfg HashMap.! k))
        putStrLn      "\tDone building"
        numbers     <- doBench benchmarks srcDir
        putStrLn      "\tDone running"
-       dayHour     <- formatTime defaultTimeLocale "%F::%R" <$> getCurrentTime
+       dayHour     <- formatTime defaultTimeLocale "%F::%T" <$> getCurrentTime
        let newResultsName = project </> dayHour <.> "raw.results"
        createDirectoryIfMissing True (resultDir </> project)
-       tag        <- getTag tagCommand
+       tag        <- getTag tagCommand project
        writeFile (resultDir </> newResultsName) (show (tag,numbers))
-       graphFiles <- doGraph resultDir project
-       putStrLn      "\tGraphed results"
        gitAddCommit resultDir newResultsName
-       mapM_ (gitAddCommit resultDir) graphFiles
-       putStrLn      "\tCommited files"
        gitPush resultDir
-       putStrLn      "\tPushed - complete!"
+       putStrLn      "\tPushed raw results"
+       X.catch (do graphFiles <- doGraph resultDir project
+                   putStrLn      "\tGraphed results"
+                   mapM_ (gitAddCommit resultDir) graphFiles
+                   gitPush resultDir)
+               (\(_ :: X.SomeException) -> return ())
+               -- Sometimes gnuplot produces an identical file and commit
+               -- then fails.  We don't care.
+       putStrLn      "\tPushed graphs - complete!"
 
 -- Build the project, returning an error or unit.
 doBuild :: Text -> FilePath -> IO ()
 doBuild cmd dir = withDirectory dir $ callCommand (Text.unpack cmd)
 
-getTag :: Text -> IO String
-getTag cmd = withDirectory project $ do
-    (_sin,sout,_serr,ph) <- runInteractiveCommand cmd
-    tag <- hGetContents sout
+getTag :: Text -> String -> IO String
+getTag cmd project = withDirectory project $ do
+    (_sin,sout,_serr,ph) <- runInteractiveCommand (Text.unpack cmd)
+    tag <- filter (`notElem` badChar) <$> hGetContents sout
     _ec <- waitForProcess ph
     return tag
+ where
+     badChar :: String
+     badChar = "\n\r\DEL"
 
 -- Perform the set of benchmarks and create a new CSV file for the results.
 -- Each benchmark has a name and a command.
@@ -215,71 +224,9 @@ doBench bs dir = withDirectory dir (HashMap.fromList <$> mapM runOne bs)
   getMem :: (a, [Double]) -> Double
   getMem (_,ms) = maximum (0:ms)
 
--- Read in any old results and graph all results together, replacing any
--- current "$benchmarkName.svg" file in the directory ($repo/$project/$name.{time,memory}.svg).
---
--- Pre-existing files should be $repo/$project/*.raw.results and be readable via
--- @read :: String -> HashMap Text (Double, DiffTime)@ (i.e. produced via 'show').
-doGraph :: FilePath -> String -> IO [FilePath]
-doGraph repoDir projectName =
-  do allNumbers <- readOldResults
-     let graphs = extractGraphData allNumbers
-     concat <$> mapM writeGraph graphs
- where
-    extractGraphData :: [HashMap Text (Double, DiffTime)] -> [(Text, [(Double,DiffTime)])]
-    extractGraphData ds =
-        let allKeys = HashMap.keys (HashMap.unions ds)
-        in [(k, catMaybes (map (HashMap.lookup k) ds)) | k <- allKeys]
-
-    readOldResults :: IO [HashMap Text (Double, DiffTime)]
-    readOldResults =
-      do let dir = repoDir </> projectName
-             isResult = (".results" ==) . takeExtension
-         resultFiles <- (sort . filter isResult) <$> getDirectoryContents dir
-         mapM (fmap read . readFile . (dir </>)) resultFiles
-
-    writeGraph :: (Text, [(Double,DiffTime)]) -> IO [FilePath]
-    writeGraph (benchName, mts) = do
-        let (ms,ts) = unzip mts
-            plot fp xs = plotLists [Custom "terminal" ["svg"], Custom "output" [quote fp]] [xs]
-            fpMS = repoDir </> projectName </> Text.unpack benchName <.> "memory" <.> "svg"
-            fpTS = repoDir </> projectName </> Text.unpack benchName <.> "time"   <.> "svg"
-        plot fpMS ms
-        plot fpTS ts
-        return [fpMS,fpTS]
-
-    quote :: String -> String
-    quote x = concat ["\"",x,"\""]
-
-withDirectory :: FilePath -> IO a -> IO a
-withDirectory fp oper =
-  do p <- getCurrentDirectory
-     setCurrentDirectory fp
-     X.finally oper (setCurrentDirectory p)
-
-timeIt :: IO a -> IO (a, DiffTime)
-timeIt oper =
-  do s <- getCurrentTime
-     r <- oper
-     e <- getCurrentTime
-     return (r,realToFrac $ diffUTCTime e s)
-
---------------------------------------------------------------------------------
---  Hacky hacky git interface, somewhat non-abstract
---  as it is tied to this use case.
---------------------------------------------------------------------------------
-
--- Clones a given url into a child directory of the cwd.
-gitClone :: Text -> FilePath -> IO FilePath
-gitClone url dir =
-    do cwd <- getCurrentDirectory
-       callCommand $ "git clone " ++ Text.unpack url ++ " " ++ dir
-       return (cwd </> dir)
-
-gitAddCommit :: FilePath -> FilePath -> IO ()
-gitAddCommit repoDir file = withDirectory repoDir $ do
-    callCommand $ "git add " ++ file
-    callCommand $ "git commit -m 'auto-commit from mss-bench' " ++ file
-
-gitPush :: FilePath -> IO ()
-gitPush fp = setCurrentDirectory fp >> callCommand "git push"
+  timeIt :: IO a -> IO (a, DiffTime)
+  timeIt oper =
+    do s <- getCurrentTime
+       r <- oper
+       e <- getCurrentTime
+       return (r,realToFrac $ diffUTCTime e s)
