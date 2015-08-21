@@ -1,9 +1,11 @@
 {-# LANGUAGE ParallelListComp    #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 module Graph where
 
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Control.Monad
+import qualified Control.Exception as X
 import qualified Data.HashMap.Strict as HashMap
 import           Data.HashMap.Strict (HashMap)
 import Graphics.Gnuplot.Simple (plotLists, Attribute(..))
@@ -48,6 +50,7 @@ doGraph repoDir projectName =
             renderedTags = paren $ intersperse "," $
                                 [quote t ++ " " ++ show n | (Just t,n) <- zip (impulse tags) [0..]]
             plot fp xs = plotLists [ XTicks (Just renderedTags)
+                                   , Custom "notitle" []
                                    , Custom "terminal" ["svg"]
                                    , Custom "output" [quote fp]] [xs]
             prefix x = repoDir </> projectName </> Text.unpack benchName <.> x

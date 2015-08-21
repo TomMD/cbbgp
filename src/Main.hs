@@ -105,8 +105,8 @@ main = do
     opts <- getOpts argCfg
     mcfg <- readConfig (iniFile opts)
     case mcfg of
-        Nothing  -> dumpUsage argCfg >> exitFailure
-        Just cfg ->
+        Left e    -> print e >> dumpUsage argCfg >> exitFailure
+        Right cfg ->
             do putStrLn $ "Read configuration file.  Executing CBBGP for " ++ show (HashMap.size cfg) ++ " projects."
                periodically (period opts) (runBenchs cfg)
 
@@ -129,12 +129,12 @@ periodically period run =
 
 -- Read an INI configuration file and return either Just a well-formed Ini
 -- with all required fields or Nothing
-readConfig :: FilePath -> IO (Maybe Config)
+readConfig :: FilePath -> IO (Either String Config)
 readConfig fp =
   do ini <- safeReadIniFile fp
      case ini of
-         Left _  -> return Nothing
-         Right c -> return $ mapM convert (unIni c)
+         Left  e -> return $ Left e
+         Right c -> return $ maybe (Left "Missing required field in INI.") Right (mapM convert (unIni c))
   where
   convert :: HashMap Text Text -> Maybe BenchInfo
   convert m =
@@ -183,10 +183,13 @@ runBenchs cfg = forM_ (HashMap.keys cfg) (\k -> cbbgp k (cfg HashMap.! k))
        gitAddCommit resultDir newResultsName
        gitPush resultDir
        putStrLn      "\tPushed raw results"
-       graphFiles <- doGraph resultDir project
-       putStrLn      "\tGraphed results"
-       mapM_ (gitAddCommit resultDir) graphFiles
-       gitPush resultDir
+       X.catch (do graphFiles <- doGraph resultDir project
+                   putStrLn      "\tGraphed results"
+                   mapM_ (gitAddCommit resultDir) graphFiles
+                   gitPush resultDir)
+               (\(_ :: X.SomeException) -> return ())
+               -- Sometimes gnuplot produces an identical file and commit
+               -- then fails.  We don't care.
        putStrLn      "\tPushed graphs - complete!"
 
 -- Build the project, returning an error or unit.
