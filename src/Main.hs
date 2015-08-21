@@ -38,7 +38,6 @@ import qualified Control.Exception as X
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Text.Read (readMaybe)
-import Data.List (sort,intersperse)
 import BenchUtils (readProcessMemory)
 import System.IO
 
@@ -53,12 +52,15 @@ import Data.Ini
 import SimpleGetOpt
 import Data.Maybe (isNothing, catMaybes)
 import System.Exit
-import Graphics.Gnuplot.Simple (plotLists, Attribute(..))
 
 -- Interacting with git:
 import System.Process (runInteractiveCommand, waitForProcess, callCommand)
 import System.Directory
 import System.FilePath ((</>), (<.>), addExtension, takeExtension)
+
+import Git
+import Utils
+import Graph
 
 argCfg :: OptSpec Opts
 argCfg =
@@ -66,7 +68,7 @@ argCfg =
 
           , progOptions     =
               [ Option ['p'] ["period"] "Number of seconds between each run"
-                  $ ReqArg "microseconds" $ \a s ->
+                  $ ReqArg "seconds" $ \a s ->
                         case (readMaybe a :: Maybe Integer) of
                           Just n | n > 0 -> Right s { period = fromIntegral n }
                           _              -> Left "Invalid period."
@@ -84,8 +86,6 @@ data BenchInfo = BI { srcRepo       :: Text
                     }
 
 data Benchmark = BM { name, benchCommand :: Text }
-
-type DiffTime = Double
 
 data Opts = Opts { period  :: NominalDiffTime
                  , iniFile :: FilePath
@@ -221,89 +221,9 @@ doBench bs dir = withDirectory dir (HashMap.fromList <$> mapM runOne bs)
   getMem :: (a, [Double]) -> Double
   getMem (_,ms) = maximum (0:ms)
 
-type Tag = String
-
--- Read in any old results and graph all results together, replacing any
--- current graph at "$repo/$project/$name.{time,memory}.svg".
---
--- Pre-existing files should be $repo/$project/*.raw.results and be readable via
--- @read :: String -> (TagText,HashMap Text (Double, DiffTime))@ (i.e. produced via 'show').
---
--- XXX The over-use of tuples makes this long-in-the-tooth. I should make a small ADT.
-doGraph :: FilePath -> String -> IO [FilePath]
-doGraph repoDir projectName =
-  do numbers <- readOldResults
-     let graphs  = extractGraphData numbers
-     concat <$> mapM writeGraph graphs
- where
-    extractGraphData :: [(Tag,HashMap Text (Double, DiffTime))] -> [(Text, [(Tag,Double,DiffTime)])]
-    extractGraphData ds =
-        let (tags,maps) = unzip ds
-            allKeys     = HashMap.keys (HashMap.unions maps)
-        in [(k, [ (tag,mem,time) | Just (mem,time) <- map (HashMap.lookup k) maps | tag <- tags]) | k <- allKeys]
-
-    readOldResults :: IO [(Tag, HashMap Text (Double, DiffTime))]
-    readOldResults =
-      do let dir = repoDir </> projectName
-             isResult = (".results" ==) . takeExtension
-         resultFiles <- (sort . filter isResult) <$> getDirectoryContents dir
-         mapM (fmap read . readFile . (dir </>)) resultFiles
-
-    writeGraph :: (Text, [(Tag,Double,DiffTime)]) -> IO [FilePath]
-    writeGraph (benchName, tmts) = do
-        let (tags, mems,times) = unzip3 tmts
-            renderedTags = paren $ intersperse "," $
-                                [quote t ++ " " ++ show n | (Just t,n) <- zip (impulse tags) [0..]]
-            plot fp xs = plotLists [ XTicks (Just renderedTags)
-                                   , Custom "terminal" ["svg"]
-                                   , Custom "output" [quote fp]] [xs]
-            prefix x = repoDir </> projectName </> Text.unpack benchName <.> x
-            fpMS     = prefix $ "memory" <.> "svg"
-            fpTS     = prefix $ "time"   <.> "svg"
-        plot fpMS mems
-        plot fpTS times
-        return [fpMS,fpTS]
-
-    -- Retain those the tags that differ from the immediately preceding tag.
-    impulse :: [Tag] -> [Maybe Tag]
-    impulse xs@(x:ys) = Just x : zipWith (\p c -> if p == c then Nothing else Just c) xs ys
-
-withDirectory :: FilePath -> IO a -> IO a
-withDirectory fp oper =
-  do p <- getCurrentDirectory
-     setCurrentDirectory fp
-     X.finally oper (setCurrentDirectory p)
-
-timeIt :: IO a -> IO (a, DiffTime)
-timeIt oper =
-  do s <- getCurrentTime
-     r <- oper
-     e <- getCurrentTime
-     return (r,realToFrac $ diffUTCTime e s)
-
---------------------------------------------------------------------------------
---  Hacky hacky git interface, somewhat non-abstract
---  as it is tied to this use case.
---------------------------------------------------------------------------------
-
--- Clones a given url into a child directory of the cwd.
-gitClone :: Text -> FilePath -> IO FilePath
-gitClone url dir =
-    do cwd <- getCurrentDirectory
-       callCommand $ "git clone " ++ quote (Text.unpack url) ++ " " ++ quote dir
-       return (cwd </> dir)
-
-gitAddCommit :: FilePath -> FilePath -> IO ()
-gitAddCommit repoDir file = withDirectory repoDir $ do
-    putStrLn $ "\t\tgit adding and committing file: " ++ quote file
-    callCommand $ "git add " ++ quote file
-    callCommand $ "git commit -m 'auto-commit from mss-bench' " ++ quote file
-
-gitPush :: FilePath -> IO ()
-gitPush fp = setCurrentDirectory fp >> callCommand "git push"
-
-quote :: String -> String
-quote x = concat ["\"",x,"\""]
-
-paren :: [String] -> [String]
-paren x = ["(", concat x, ")"]
+  timeIt :: IO a -> IO (a, DiffTime)
+  timeIt oper =
+    do s <- getCurrentTime
+       r <- oper
+       e <- getCurrentTime
+       return (r,realToFrac $ diffUTCTime e s)
