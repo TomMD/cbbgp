@@ -50,7 +50,7 @@ doGraph repoDir projectName =
             renderedTags = paren $ intersperse "," $
                                 [quote t ++ " " ++ show n | (Just t,n) <- zip (impulse tags) [0..]]
             plot fp xs = plotLists [ XTicks (Just renderedTags)
-                                   , Custom "notitle" []
+                                   , Custom "nokey" []
                                    , Custom "terminal" ["svg"]
                                    , Custom "output" [quote fp]] [xs]
             prefix x = repoDir </> projectName </> Text.unpack benchName <.> x
