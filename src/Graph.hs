@@ -49,15 +49,18 @@ doGraph repoDir projectName =
         let (tags, mems,times) = unzip3 tmts
             renderedTags = paren $ intersperse "," $
                                 [quote t ++ " " ++ show n | (Just t,n) <- zip (impulse tags) [0..]]
-            plot fp xs = plotLists [ XTicks (Just renderedTags)
-                                   , Custom "nokey" []
-                                   , Custom "terminal" ["svg"]
-                                   , Custom "output" [quote fp]] [xs]
+            plot fp xs lbl = plotLists [ XTicks (Just renderedTags)
+                                       , XLabel "Version"
+                                       , YLabel lbl
+                                       , YRange (0, 1.1 * maximum xs)
+                                       , Custom "nokey" []
+                                       , Custom "terminal" ["svg"]
+                                       , Custom "output" [quote fp]] [xs]
             prefix x = repoDir </> projectName </> Text.unpack benchName <.> x
             fpMS     = prefix $ "memory" <.> "svg"
             fpTS     = prefix $ "time"   <.> "svg"
-        plot fpMS mems
-        plot fpTS times
+        plot fpMS mems "Bytes"
+        plot fpTS times "Seconds"
         return [fpMS,fpTS]
 
     -- Retain those the tags that differ from the immediately preceding tag.
