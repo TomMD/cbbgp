@@ -24,7 +24,7 @@ gitAddCommit :: FilePath -> FilePath -> IO ()
 gitAddCommit repoDir file = withDirectory repoDir $ do
     putStrLn $ "\t\tgit adding and committing file: " ++ quote file
     callCommand $ "git add " ++ quote file
-    callCommand $ "git commit -m 'auto-commit from mss-bench' " ++ quote file
+    callCommand $ "git commit -m 'auto-commit from the cbbgp benchmarking tool' " ++ quote file
 
 gitPush :: FilePath -> IO ()
 gitPush fp = setCurrentDirectory fp >> callCommand "git push"
