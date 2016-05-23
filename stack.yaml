@@ -1,10 +1,13 @@
 flags: {}
 packages:
 - '.'
-- ../../bench
+- location:
+    git: https://github.com/TomMD/bench.git
+    commit: 7f5f9d136fb0bdce1c243a76e05877250a4bb495
 resolver: nightly-2015-08-18
 extra-deps:
 - gnuplot-0.5.4
 - simple-get-opt-0.1.0.0
 - data-accessor-transformers-0.2.1.6
 - utility-ht-0.0.11
+- bench-0.1.0.0

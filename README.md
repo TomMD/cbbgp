@@ -1,8 +1,8 @@
 # CBBGP: Clone-Build-Bench-Graph-Push
 
-CBBGP is a script for pulling from one or more repositories, building,
-benchmarking, producing performance graphs, and pushing these results (SVG
-graphs included) to a repository with a hard-coded directory structure.
+CBBGP is a LINUX ONLY script for pulling from one or more repositories,
+building, benchmarking, producing performance graphs, and pushing these results
+(SVG graphs included) to a repository with a hard-coded directory structure.
 
 # Use
 
